@@ -30,6 +30,8 @@ El primer paso es obtener y cargar el archivo CSV que contiene los resultados hi
 | `r6` | int | Sexto numero sorteado |
 | `r7` | int | Numero adicional (si aplica) |
 
+> **Manejo del numero adicional (r7):** Si `r7` existe en el CSV, se registra pero se **excluye del modelado predictivo**. Todas las formulas de este plan usan `m = 6` (numeros principales del sorteo). El numero adicional `r7` puede provenir de un bolillero diferente o tener reglas distintas, por lo que incluirlo como target invalidaria los calculos de probabilidad (`P_baseline = m/N = 6/56`). Sin embargo, la frecuencia historica de `r7` puede usarse como **feature adicional** (informacion contextual) si se valida que no introduce fuga temporal.
+
 ### 1.3 Proceso de Carga y Validacion
 
 1. **Lectura del CSV** con `pandas.read_csv()`.
@@ -424,17 +426,23 @@ Para cada numero `k` y una ventana de `w` sorteos previos:
 
 ### 4.3 Features Combinatorias
 
-#### 4.3.1 Entropia de Shannon del Sorteo
+#### 4.3.1 Entropia de Shannon del Sorteo (basada en Decenas)
 
-Mide la "sorpresa" o diversidad de un sorteo:
+Mide la diversidad de un sorteo segun la distribucion de sus numeros entre decenas:
 
 ```
-H = -SUM p_i * log2(p_i)
+d_i = count(numeros del sorteo en decena i) / m    para i in {0, 1, 2, 3, 4, 5}
+
+H_decenas = -SUM d_i * log2(d_i)                   (ignorando d_i = 0)
 ```
 
-Donde `p_i = r_i / SUM(r_j)`. Sorteos con numeros muy dispersos tienen mayor entropia.
+Donde las decenas son: 0=[1-9], 1=[10-19], 2=[20-29], 3=[30-39], 4=[40-49], 5=[50-56].
 
-> **Nota:** Esta definicion de `p_i` es una aproximacion heuristica para asignar pesos a los numeros dentro de un sorteo. No representa una distribucion de probabilidad formal del juego, sino una medida relativa de la dispersion de valores.
+- Un sorteo con numeros distribuidos en 5 decenas tiene **alta entropia** (diverso).
+- Un sorteo con todos los numeros en la misma decena tiene **entropia 0** (concentrado).
+- Entropia maxima: `log2(6) = 2.585` (un numero en cada decena, caso ideal).
+
+> **Correccion v3:** La version anterior usaba `p_i = r_i / SUM(r_j)`, que normalizaba los valores numericos directamente como probabilidades. Esto producía resultados sin interpretacion clara (el sorteo {1,2,3,4,5,6} tendria "probabilidades" muy diferentes a {51,52,53,54,55,56} aunque ambos son igualmente consecutivos). La entropia sobre decenas tiene una interpretacion genuina: mide la dispersion espacial del sorteo en el rango de numeros.
 
 #### 4.3.2 Distancia de Mahalanobis
 
@@ -554,7 +562,7 @@ w_negativa = n / (2 * (n - f(k))) ~= 0.56
 threshold_optimo = argmax_t [Hit_Rate(P > t)]
 ```
 
-3. **Metricas sensibles al desbalance**: Usar Brier Score y Log-Loss (ya incluidos en 5.6.2) que penalizan naturalmente las probabilidades mal calibradas, en lugar de accuracy que seria engañosa (~89% prediciendo siempre "no aparece").
+3. **Metricas sensibles al desbalance**: Usar Brier Score y Log-Loss (ya incluidos en 5.7.2) que penalizan naturalmente las probabilidades mal calibradas, en lugar de accuracy que seria engañosa (~89% prediciendo siempre "no aparece").
 
 ### 5.0.1 Reformulacion del Problema: Clasificacion Multi-etiqueta Combinatoria
 
@@ -577,7 +585,7 @@ Este enfoque es superior porque:
 3. Permite aplicar restricciones combinatorias naturalmente.
 4. Es compatible con metricas de negocio como Hit@k.
 
-### 5.0.1 Baseline Obligatorio: Modelo Uniforme Aleatorio
+### 5.0.2 Baseline Obligatorio: Modelo Uniforme Aleatorio
 
 **TODO modelo debe superar este baseline** para justificar su complejidad:
 
@@ -654,7 +662,7 @@ Donde `f(k)` es la frecuencia absoluta del numero `k` y `n` es el total de sorte
 IC_95%(theta_k) = [Beta_inv(0.025, a_post, b_post), Beta_inv(0.975, a_post, b_post)]
 ```
 
-#### 5.1.2 Variante con Ventana Temporal
+#### 5.1.2 Variante con Ventana Temporal (Hard Window)
 
 Para capturar tendencias recientes, usamos solo los ultimos `w` sorteos:
 
@@ -664,7 +672,29 @@ P_bayes_temporal(k) = ---------------------------
                            2 + w
 ```
 
-#### 5.1.3 Por que Frecuencias Bayesianas como Primer Modelo
+#### 5.1.3 Variante con Decaimiento Exponencial (Soft Window)
+
+La ventana dura de 5.1.2 crea un efecto "cliff": el sorteo `w+1` pasa de tener peso completo a cero instantaneamente. Una alternativa mas suave es ponderar cada observacion con decaimiento exponencial:
+
+```
+                     alpha + SUM lambda^(t_actual - t_i) * I(k in sorteo_i)
+P_bayes_exp(k) = ------------------------------------------------------------------
+                     alpha + beta + SUM lambda^(t_actual - t_i)
+```
+
+Donde:
+- `lambda` = factor de decaimiento (recomendado: `0.998` para que sorteos de hace ~500 turnos tengan ~37% del peso)
+- `I(k in sorteo_i)` = 1 si `k` aparecio en el sorteo `i`, 0 en caso contrario
+- La suma recorre todos los sorteos `i` del historico
+
+**Seleccion de lambda:** El valor de `lambda` controla la "memoria" del modelo:
+- `lambda = 1.0`: todos los sorteos pesan igual (equivale a 5.1.1)
+- `lambda = 0.998`: vida media ~347 sorteos
+- `lambda = 0.995`: vida media ~139 sorteos (mas sensible a tendencias recientes)
+
+> La variante exponencial es el estandar en series temporales financieras (EWMA) y es preferible cuando se sospecha que las tendencias cambian gradualmente.
+
+#### 5.1.4 Por que Frecuencias Bayesianas como Primer Modelo
 
 - **Simplicidad**: Facil de implementar, interpretar y depurar.
 - **Regularizacion natural**: El prior evita probabilidades de 0 o 1 con pocos datos.
@@ -736,19 +766,28 @@ Donde:
 - `eta` = learning rate (tasa de aprendizaje)
 - `h_m(x)` = arbol que predice el gradiente negativo de la funcion de perdida
 
-**Funcion de perdida (MSE):**
+**Funcion de perdida (Log-Loss para clasificacion binaria):**
 
 ```
-L(y, F(x)) = (1/2) * (y - F(x))^2
+L(y, p) = -[y * log(p) + (1 - y) * log(1 - p)]
 ```
 
-**Gradiente negativo (pseudo-residuos):**
+Donde `y` es la etiqueta binaria (numero aparecio o no) y `p = sigmoid(F(x))` es la probabilidad predicha.
+
+**Transformacion a probabilidad (sigmoide):**
 
 ```
-r_im = -dL/dF(x_i) = y_i - F_{m-1}(x_i)
+p = sigmoid(F(x)) = 1 / (1 + exp(-F(x)))
 ```
 
-Cada nuevo arbol `h_m` se entrena para predecir estos residuos.
+**Gradiente y Hessiana (para optimizacion Newton-Raphson en XGBoost):**
+
+```
+g_i = dL/dF(x_i) = p_i - y_i           (gradiente de primer orden)
+h_i = d^2L/dF^2(x_i) = p_i * (1 - p_i) (hessiana de segundo orden)
+```
+
+Cada nuevo arbol `h_m` se ajusta para minimizar una aproximacion de segundo orden de la perdida usando `g_i` y `h_i`.
 
 **Regularizacion (XGBoost):**
 
@@ -762,13 +801,7 @@ Donde:
 - `T_j` = numero de hojas del arbol `j`
 - `w_j` = pesos de las hojas
 
-**Reformulado como clasificacion:** Usamos `XGBClassifier` con funcion de perdida de log-loss:
-
-```
-L(y, p) = -[y * log(p) + (1-y) * log(1-p)]
-```
-
-Donde `y` es la etiqueta binaria (numero aparecio o no) y `p` es la probabilidad predicha.
+> **Correccion v3:** La version anterior incluia la funcion de perdida MSE (`(1/2)(y - F(x))^2`) y pseudo-residuos de regresion (`r_im = y_i - F_{m-1}(x_i)`), lo cual era inconsistente con la reformulacion como clasificacion multi-etiqueta. Las formulas ahora son las correctas para clasificacion binaria con Log-Loss.
 
 #### 5.3.2 Por que Gradient Boosting
 
@@ -937,7 +970,7 @@ study.optimize(objective, n_trials=100)
 
 ### 5.7 Evaluacion y Seleccion de Modelos
 
-#### 5.6.1 Validacion Walk-Forward Estricta
+#### 5.7.1 Validacion Walk-Forward Estricta
 
 En lugar de K-Fold estandar (que mezcla datos temporales), usamos **Walk-Forward Validation** que simula exactamente como se usaria el modelo en produccion:
 
@@ -949,6 +982,18 @@ Para t = T_inicio hasta T_final:
     4. Avanzar: t = t + 1
 ```
 
+**Ventana minima de entrenamiento:**
+
+```
+T_inicio = max(500, floor(0.6 * n_total))
+T_final = n_total
+Sorteos de evaluacion = T_final - T_inicio
+```
+
+Para ~5,000 sorteos: `T_inicio = 3,000`, evaluacion sobre `2,000` sorteos. Este compromiso asegura:
+- Datos suficientes para que los modelos entrenen de forma estable.
+- Suficientes sorteos de evaluacion para que el test binomial tenga potencia estadistica (ver 5.7.5).
+
 **Variante con ventana deslizante** (para capturar cambios de regimen):
 
 ```
@@ -956,6 +1001,8 @@ Para t = T_inicio hasta T_final:
     1. Entrenar modelo con sorteos max(1, t-W)..t-1   (ventana de W sorteos)
     2. Predecir sorteo t
     3. Registrar aciertos
+
+W recomendada = 1,000 sorteos (ajustable segun analisis de estabilidad)
 ```
 
 Esto es mas riguroso que Time Series Split porque:
@@ -963,7 +1010,7 @@ Esto es mas riguroso que Time Series Split porque:
 - Nunca usa datos futuros para entrenar.
 - Simula el uso real del sistema.
 
-#### 5.6.2 Metricas de Evaluacion (Priorizadas por Relevancia)
+#### 5.7.2 Metricas de Evaluacion (Priorizadas por Relevancia)
 
 **Metricas PRIMARIAS (metricas de negocio):**
 
@@ -1040,7 +1087,7 @@ MAE = (1/n) SUM |y_i - y_hat_i|
 RMSE = sqrt((1/n) SUM (y_i - y_hat_i)^2)
 ```
 
-#### 5.6.3 Calibracion de Probabilidades
+#### 5.7.3 Calibracion de Probabilidades
 
 Las probabilidades crudas de los modelos suelen estar mal calibradas. Aplicaremos:
 
@@ -1075,9 +1122,9 @@ Para cada bin b con probabilidad media p_b:
     Modelo calibrado: frecuencia_real_b ~ p_b
 ```
 
-#### 5.6.4 Comparacion Obligatoria contra Baseline
+#### 5.7.4 Comparacion Obligatoria contra Baseline
 
-**Regla de decision:**
+**Regla de decision (test binomial):**
 
 ```
 Si p_value(test binomial, modelo vs baseline) < 0.05:
@@ -1087,10 +1134,10 @@ Si no:
     -> Adoptar enfoque descriptivo (analisis de patrones sin prediccion)
 ```
 
-Adicional, compararemos contra **S=10,000 simulaciones aleatorias equivalentes**:
+**Validacion empirica adicional: S=10,000 simulaciones aleatorias equivalentes:**
 
 ```
-Para s = 1 hasta S:
+Para s = 1 hasta 10,000:
     1. Generar predicciones aleatorias (m numeros de N)
     2. Calcular Hit_Rate de las predicciones aleatorias
 
@@ -1101,6 +1148,46 @@ Si percentil_modelo > 0.95:
 Si no:
     -> Modelo NO supera al azar
 ```
+
+**Regla de decision final (PREDICTIVO vs DESCRIPTIVO):**
+
+```
+Si percentil_modelo > 95% de forma consistente en walk-forward:
+    -> Sistema en modo PREDICTIVO: generar y reportar predicciones
+Si no:
+    -> Sistema en modo DESCRIPTIVO: reportar analisis de patrones,
+       frecuencias y tendencias SIN emitir predicciones numericas
+```
+
+#### 5.7.5 Analisis de Potencia Estadistica
+
+Antes de ejecutar el pipeline completo, debemos verificar que tenemos **suficientes datos** para detectar una mejora real sobre el baseline. Sin este analisis, podriamos concluir "no hay mejora" cuando el problema real es falta de poder estadistico.
+
+**Formula de tamano de muestra minimo:**
+
+```
+                (z_alpha + z_beta)^2 * p_0 * (1 - p_0)
+n_minimo = ---------------------------------------------------
+                            delta^2
+```
+
+Donde:
+- `z_alpha` = 1.645 (para test unilateral, alpha = 0.05)
+- `z_beta` = 0.842 (para potencia del 80%)
+- `p_0` = probabilidad del baseline = m/N = 0.1071
+- `delta` = mejora minima que queremos detectar
+
+**Requerimientos segun nivel de mejora:**
+
+| Mejora (delta) | n_minimo (sorteos evaluacion) | Interpretacion |
+|----------------|-------------------------------|----------------|
+| 0.01 (1%) | ~3,650 | Mejora muy sutil, dificil de detectar |
+| 0.02 (2%) | ~912 | Mejora moderada, factible con ~5,000 sorteos |
+| 0.05 (5%) | ~146 | Mejora grande, facil de detectar |
+
+Con ~5,000 sorteos totales y `T_inicio = 3,000`, tenemos ~2,000 sorteos de evaluacion. Esto es suficiente para detectar mejoras de **delta >= 0.015 (1.5%)** con 80% de potencia.
+
+**Regla practica:** Si el test binomial no rechaza H0 con 2,000 sorteos de evaluacion, podemos afirmar con confianza que el modelo no mejora mas de 1.5% sobre el azar.
 
 ### 5.7 Libreria Principal: scikit-learn
 
@@ -1154,7 +1241,26 @@ w_m = -------------------------
 
 Donde `BS_m` es el Brier Score del modelo `m` en walk-forward validation. Se usa Brier Score (no RMSE) porque es la metrica apropiada para evaluar probabilidades calibradas en clasificacion binaria.
 
-> **Nota (correccion v2):** La version anterior usaba RMSE para ponderar el ensamble, lo cual era inconsistente con la definicion de RMSE como metrica terciaria "NO para decision" en el Paso 5.6.2. Se corrigio para usar metricas de clasificacion.
+> **Nota (correccion v2):** La version anterior usaba RMSE para ponderar el ensamble, lo cual era inconsistente con la definicion de RMSE como metrica terciaria "NO para decision" en el Paso 5.7.2. Se corrigio para usar metricas de clasificacion.
+
+#### 6.1.1 Validacion de Diversidad del Ensamble
+
+Antes de combinar modelos, verificar que sus predicciones no sean redundantes:
+
+```
+Para cada par de modelos (m, n):
+    rho(m, n) = correlacion_pearson(P_m(k=1..N), P_n(k=1..N))
+```
+
+**Regla de diversidad:**
+
+```
+Si rho(m, n) > 0.95 para algun par:
+    -> Solo incluir el modelo con mejor Brier Score del par
+    -> El ensamble no reduce varianza si los modelos predicen lo mismo
+```
+
+> **Justificacion:** Un ensamble de modelos altamente correlacionados (ej. RF y GB que son ambos ensambles de arboles) no reduce varianza efectivamente. Es preferible un ensamble diverso (ej. Bayesiano + GB + Markov) que combine diferentes perspectivas sobre los datos.
 
 ### 6.2 Seleccion de Combinacion Optima
 
@@ -1169,10 +1275,10 @@ Una vez que tenemos `P_final(k)` para cada numero, seleccionamos la combinacion:
 
 ### 6.3 Simulacion de Monte Carlo
 
-Para evaluar la robustez de las predicciones, realizamos `S` simulaciones:
+Para evaluar la robustez de las predicciones, realizamos **S = 10,000** simulaciones:
 
 ```
-Para s = 1 hasta S:
+Para s = 1 hasta 10,000:
     1. Muestrear combinacion C_s usando P_final como distribucion
     2. Verificar C_s contra restricciones
     3. Almacenar C_s si es valida
@@ -1182,10 +1288,10 @@ Score_numero(k) = count(k in C_s para todo s valido) / S_valido
 
 Numeros que aparecen consistentemente en las combinaciones simuladas tienen mayor confianza.
 
-**Intervalos de confianza via bootstrap:**
+**Intervalos de confianza via bootstrap (B = 1,000 iteraciones):**
 
 ```
-Para b = 1 hasta B:
+Para b = 1 hasta 1,000:
     1. Remuestrear con reemplazo los datos de entrenamiento
     2. Re-entrenar modelos
     3. Generar prediccion
@@ -1193,30 +1299,11 @@ Para b = 1 hasta B:
 IC(95%) = [percentil_2.5(predicciones), percentil_97.5(predicciones)]
 ```
 
-### 6.4 Comparacion Final contra Simulaciones Aleatorias
+> **Nota:** S=10,000 para Monte Carlo y B=1,000 para bootstrap son valores estandar en la literatura estadistica. S=10,000 proporciona precision de ~1% en los percentiles. B=1,000 es suficiente para estimar intervalos de confianza al 95% de forma estable.
 
-Antes de aceptar cualquier prediccion como valida, la comparamos contra `S=10,000` simulaciones de seleccion puramente aleatoria:
+### 6.4 Comparacion contra Simulaciones Aleatorias
 
-```
-Para s = 1 hasta 10,000:
-    1. Seleccionar m numeros uniformemente al azar de [1, N]
-    2. Calcular aciertos contra el sorteo real
-
-Distribucion_azar = histograma(aciertos de las 10,000 simulaciones)
-Percentil_modelo = P(aciertos_azar < aciertos_modelo)
-```
-
-Esto proporciona una medida empirica de si las predicciones del modelo son genuinamente superiores al azar o si los resultados observados podrian deberse a varianza aleatoria.
-
-**Regla de decision final:**
-
-```
-Si Percentil_modelo > 95% de forma consistente en walk-forward:
-    -> Sistema en modo PREDICTIVO: generar y reportar predicciones
-Si no:
-    -> Sistema en modo DESCRIPTIVO: reportar analisis de patrones,
-       frecuencias y tendencias SIN emitir predicciones numericas
-```
+> La comparacion formal contra simulaciones aleatorias se realiza en la **Seccion 5.7.4** como parte de la evaluacion de modelos. Aqui solo se verifica que las predicciones finales del ensamble (despues de calibracion y restricciones) mantienen su superioridad. Si el ensamble ya paso el test en 5.7.4, este paso es una confirmacion final, no una evaluacion independiente.
 
 ### 6.5 Libreria: matplotlib
 
@@ -1285,7 +1372,7 @@ Cada ejecucion registrara:
                                                     5.0 Manejo desbalance clases
                                                               |
                                                               v
-                                                    5.0.1 Baseline uniforme
+                                                    5.0.2 Baseline uniforme
                                                               |
                                                               v
 9. Exportar  <--  8. Evaluar vs baseline  <--  7. Entrenar modelos
@@ -1296,6 +1383,9 @@ Cada ejecucion registrara:
   (segun resultado                                   |
    vs baseline)                              5.6 Reproducibilidad
                                                (random_state, hash)
+                                                      |
+                                              5.7.5 Potencia estadistica
+                                               (verificar n suficiente)
 ```
 
 ---

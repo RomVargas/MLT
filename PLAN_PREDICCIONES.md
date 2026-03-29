@@ -1,5 +1,7 @@
 # Plan de Desarrollo - Script de Predicciones MLT
 
+> **NOTA:** Este documento ha sido **SUPERADO** por `PLAN_MATEMATICO_MLT.md` (v3) y `PLAN_PASO_A_PASO.md`. Se mantiene como referencia historica del plan original. Para el plan vigente, consultar `PLAN_MATEMATICO_MLT.md`.
+
 ## Objetivo
 
 Crear un script en Python que genere predicciones del MLT a partir de resultados históricos contenidos en un archivo CSV.
