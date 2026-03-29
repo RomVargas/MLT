@@ -172,6 +172,8 @@ Si `X^2 > X^2_critico(alpha, df)` entonces rechazamos la hipotesis nula de unifo
 
 ### 2.3 Clasificacion de Numeros
 
+> **Advertencia sobre la Falacia del Jugador:** Si los sorteos son eventos independientes (como se espera en loterias modernas), las frecuencias pasadas **no predicen** resultados futuros. Que un numero haya aparecido mucho (caliente) o poco (frio) no altera su probabilidad en el proximo sorteo. Esta clasificacion es util para el **analisis descriptivo** (entender la distribucion historica), pero su valor predictivo debe ser **validado formalmente** con el test chi-cuadrado (Paso 2.2.3) antes de incluir estos features en modelos predictivos. Solo si el test rechaza la hipotesis de uniformidad se justifica usar frecuencias como features.
+
 #### 2.3.1 Numeros Calientes (Hot Numbers)
 
 ```
@@ -465,7 +467,57 @@ Donde `f_k` es el valor del feature en la ventana `k`. Features con `Estabilidad
 
 3. **Test de causalidad temporal**: Para cada feature, comparar su correlacion con el target en datos pasados vs. datos futuros. Si la correlacion futura es significativamente mayor, el feature tiene fuga temporal.
 
-### 4.5 Libreria: scikit-learn (sklearn)
+### 4.5 Seleccion Formal de Features (Prevencion de Overfitting)
+
+> **Correccion v2:** El plan original define ~18+ features para un dataset de ~5,000 sorteos. Esto genera un riesgo serio de overfitting, especialmente en modelos como Gradient Boosting que pueden memorizar ruido. Se agrega esta fase obligatoria de seleccion.
+
+#### 4.5.1 Filtrado por Informacion Mutua
+
+Calcular la informacion mutua entre cada feature y el target (aparicion de cada numero):
+
+```
+MI(feature_j, target_k) = mutual_information_classif(X[:, j], y_k)
+```
+
+Features con `MI < umbral` se descartan. El umbral se determina empiricamente comparando contra features aleatorios (permutation importance).
+
+#### 4.5.2 Eliminacion Recursiva de Features (RFE)
+
+Usando el Random Forest como estimador base:
+
+```
+Para i = num_features hasta min_features:
+    1. Entrenar RF con features actuales
+    2. Calcular importancia de cada feature
+    3. Eliminar el feature menos importante
+    4. Evaluar rendimiento con walk-forward
+    5. Registrar score
+
+Seleccionar el subconjunto con mejor score en walk-forward
+```
+
+#### 4.5.3 Regla de Dimensionalidad
+
+Limitar el numero maximo de features a:
+
+```
+max_features = sqrt(n_sorteos_entrenamiento)
+```
+
+Para ~5,000 sorteos: `max_features ~ 70`. Pero en la practica, limitaremos a **los top 5-8 features mas informativos** para mantener el modelo interpretable y robusto.
+
+#### 4.5.4 Validacion con Features Aleatorios (Boruta-like)
+
+Para cada feature real, generar una version permutada aleatoriamente. Si la importancia del feature real no supera significativamente la del feature aleatorio, descartarlo:
+
+```
+Para cada feature_j:
+    feature_j_aleatorio = np.random.permutation(feature_j)
+    Si Imp(feature_j) <= max(Imp(features_aleatorios)):
+        -> Descartar feature_j (no aporta mas que ruido)
+```
+
+### 4.6 Libreria: scikit-learn (sklearn)
 
 **Por que scikit-learn es la opcion optima para ingenieria de features:**
 
@@ -481,7 +533,30 @@ Donde `f_k` es el valor del feature en la ventana `k`. Features con `Estabilidad
 
 ## Paso 5: Modelos de Machine Learning para Prediccion
 
-### 5.0 Reformulacion del Problema: Clasificacion Multi-etiqueta Combinatoria
+### 5.0 Manejo del Desbalance de Clases
+
+> **Correccion v2:** Cada numero aparece en ~10.7% de los sorteos (clase positiva) y no aparece en ~89.3% (clase negativa). Este desbalance no se abordaba en la version anterior. Sin tratamiento, los modelos tienden a predecir "no aparece" para todos los numeros.
+
+**Estrategias de manejo (en orden de prioridad):**
+
+1. **Pesos de clase balanceados**: Configurar `class_weight='balanced'` en RF y GB:
+
+```
+w_clase = n_total / (n_clases * n_muestras_clase)
+
+w_positiva = n / (2 * f(k))      ~= 4.67  (para frecuencia tipica)
+w_negativa = n / (2 * (n - f(k))) ~= 0.56
+```
+
+2. **Threshold tuning**: En lugar de usar 0.5 como umbral de decision, optimizar el threshold que maximiza el Hit Rate:
+
+```
+threshold_optimo = argmax_t [Hit_Rate(P > t)]
+```
+
+3. **Metricas sensibles al desbalance**: Usar Brier Score y Log-Loss (ya incluidos en 5.6.2) que penalizan naturalmente las probabilidades mal calibradas, en lugar de accuracy que seria engañosa (~89% prediciendo siempre "no aparece").
+
+### 5.0.1 Reformulacion del Problema: Clasificacion Multi-etiqueta Combinatoria
 
 **Cambio critico respecto al enfoque original:** En lugar de tratar la prediccion como un problema de **regresion** (predecir numeros exactos), lo reformulamos como un problema **combinatorio/multi-etiqueta**:
 
@@ -702,53 +777,9 @@ Donde `y` es la etiqueta binaria (numero aparecio o no) y `p` es la probabilidad
 - **Manejo de missing values**: XGBoost aprende automaticamente la direccion optima para nulos.
 - **Probabilidades calibradas**: La funcion sigmoide de salida produce probabilidades directamente.
 
-### 5.4 Modelo 4: Red Neuronal LSTM (Long Short-Term Memory) [OPCIONAL]
+### 5.4 ~~Modelo 4: Red Neuronal LSTM~~ [ELIMINADO en v2]
 
-#### 5.4.1 Fundamento Matematico
-
-LSTM es una arquitectura de red neuronal recurrente diseñada para aprender dependencias a largo plazo en secuencias:
-
-**Puerta de Olvido (Forget Gate):**
-
-```
-f_t = sigma(W_f * [h_{t-1}, x_t] + b_f)
-```
-
-**Puerta de Entrada (Input Gate):**
-
-```
-i_t = sigma(W_i * [h_{t-1}, x_t] + b_i)
-C_tilde_t = tanh(W_C * [h_{t-1}, x_t] + b_C)
-```
-
-**Actualizacion del Estado de Celda:**
-
-```
-C_t = f_t (*) C_{t-1} + i_t (*) C_tilde_t
-```
-
-Donde `(*)` denota multiplicacion elemento a elemento (Hadamard product).
-
-**Puerta de Salida (Output Gate):**
-
-```
-o_t = sigma(W_o * [h_{t-1}, x_t] + b_o)
-h_t = o_t (*) tanh(C_t)
-```
-
-Donde:
-- `sigma` = funcion sigmoide: `sigma(z) = 1 / (1 + e^(-z))`
-- `tanh(z) = (e^z - e^(-z)) / (e^z + e^(-z))`
-- `W_f, W_i, W_C, W_o` = matrices de pesos
-- `b_f, b_i, b_C, b_o` = vectores de sesgo
-
-#### 5.4.2 Por que LSTM
-
-- **Memoria a largo plazo**: Puede capturar patrones ciclicos que se extienden por cientos de sorteos.
-- **Procesamiento secuencial**: Trata los sorteos como una serie temporal, manteniendo contexto.
-- **Flexibilidad**: Puede modelar relaciones temporales complejas y no lineales.
-
-> **IMPORTANTE — Modelo de baja prioridad:** LSTM solo se implementara si los modelos mas simples (Frecuencias Bayesianas, Random Forest, Gradient Boosting) demuestran que existen patrones temporales significativos en los datos (verificado via autocorrelacion significativa en Paso 3.5.3). Si la autocorrelacion no es significativa, LSTM no se justifica y se omitira. Ademas, `tensorflow/keras` no esta en `requirements.txt` actualmente; solo se agregara si se decide implementar LSTM.
+> **Eliminado (v2):** LSTM requiere tensorflow/keras, tiene ordenes de magnitud mas parametros que los demas modelos, necesita mucho mas tuning, y para ~5,000 filas no hay suficientes datos para entrenar una red recurrente de forma robusta. Si existe autocorrelacion significativa (Paso 3.5.3), Gradient Boosting con features temporales (tendencia, rezago, ciclo_medio, aceleracion) ya captura la misma informacion temporal de forma mas eficiente. Se elimina para simplificar el stack y reducir la complejidad innecesaria.
 
 ### 5.5 Modelo 5: Cadenas de Markov
 
@@ -801,13 +832,110 @@ P^n = Q * Lambda^n * Q^(-1)
 
 Donde `Lambda` es la matriz diagonal de autovalores de `P` y `Q` la matriz de autovectores.
 
-#### 5.5.2 Por que Cadenas de Markov
+#### 5.5.2 Validacion Obligatoria de Dependencia Secuencial
+
+> **Advertencia critica:** Las Cadenas de Markov asumen que el estado siguiente **depende** del estado actual (`P(X_{n+1}|X_n) != P(X_{n+1})`). En loteria, si los sorteos son independientes, la matriz de transicion deberia converger a probabilidades uniformes y el modelo no aportaria nada sobre el baseline.
+
+**Antes de implementar este modelo, se debe validar la dependencia secuencial con:**
+
+**Test de Rachas (Runs Test):**
+
+Verifica si la secuencia de apariciones de cada numero es aleatoria:
+
+```
+H0: La secuencia de apariciones es aleatoria (independencia)
+H1: Existe dependencia secuencial
+
+Z_rachas = (R - E[R]) / sqrt(Var(R))
+```
+
+Donde `R` es el numero de rachas observadas.
+
+**Test de Ljung-Box:**
+
+Verifica si existe autocorrelacion significativa en la serie:
+
+```
+              L
+Q(L) = n(n+2) SUM  rho_k^2 / (n-k)
+              k=1
+```
+
+Si `Q(L) > X^2_critico(alpha, L)`, existe dependencia secuencial.
+
+**Regla de decision:**
+
+```
+Si p_value(Runs Test) < 0.05 O p_value(Ljung-Box) < 0.05:
+    -> Implementar Cadenas de Markov
+Si no:
+    -> Descartar Cadenas de Markov (sorteos son independientes)
+```
+
+#### 5.5.3 Por que Cadenas de Markov (si se valida dependencia)
 
 - **Interpretabilidad**: Las probabilidades de transicion son directamente comprensibles.
 - **Prediccion directa**: `P^n` nos da probabilidades de prediccion a `n` sorteos futuros.
 - **Deteccion de patrones secuenciales**: Captura que numeros tienden a "seguir" a otros.
 
-### 5.6 Evaluacion y Seleccion de Modelos
+### 5.6 Reproducibilidad y Versionado
+
+> **Correccion v2:** Se agrega como requisito transversal para todos los modelos.
+
+#### 5.6.0.1 Semillas Aleatorias
+
+Fijar `random_state` en **todos** los componentes estocasticos:
+
+```python
+RANDOM_STATE = 42
+
+RandomForestClassifier(random_state=RANDOM_STATE)
+GradientBoostingClassifier(random_state=RANDOM_STATE)
+train_test_split(random_state=RANDOM_STATE)
+np.random.seed(RANDOM_STATE)
+```
+
+#### 5.6.0.2 Versionado de Datos
+
+Cada ejecucion registrara un hash del CSV para auditar reproducibilidad:
+
+```
+data_hash = hashlib.sha256(csv_bytes).hexdigest()[:16]
+data_version = f"v{n_sorteos}_{fecha_ultimo_sorteo}_{data_hash}"
+```
+
+#### 5.6.0.3 Estrategia de Hyperparameter Tuning
+
+En lugar de GridSearchCV estandar (que viola el orden temporal con K-Fold), usar **busqueda con TimeSeriesSplit**:
+
+```
+Para cada combinacion de hiperparametros:
+    1. Crear TimeSeriesSplit(n_splits=5) sobre los datos de entrenamiento
+    2. Evaluar con Brier Score en cada split temporal
+    3. Promediar scores
+
+Seleccionar hiperparametros con mejor Brier Score promedio
+```
+
+**Alternativa preferida: Optuna** (busqueda bayesiana):
+
+```
+import optuna
+
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 500),
+        'max_depth': trial.suggest_int('max_depth', 3, 15),
+        'min_samples_leaf': trial.suggest_int('min_samples_leaf', 5, 50),
+    }
+    score = walk_forward_evaluate(model_class(**params), data)
+    return score  # Brier Score (minimizar)
+
+study = optuna.create_study(direction='minimize')
+study.optimize(objective, n_trials=100)
+```
+
+### 5.7 Evaluacion y Seleccion de Modelos
 
 #### 5.6.1 Validacion Walk-Forward Estricta
 
@@ -984,8 +1112,9 @@ Si no:
 - **Pipelines**: Encadenan preprocesamiento + modelo en un solo objeto reproducible.
 - **Comunidad y documentacion**: La libreria de ML mas usada en Python con documentacion exhaustiva.
 - **Alternativas complementarias**:
-  - `xgboost`: Se usara como complemento para Gradient Boosting optimizado (mas rapido que sklearn GBC).
-  - `tensorflow/keras`: Solo si LSTM se justifica por autocorrelacion significativa; no se incluira por defecto.
+  - `xgboost`: Se usara como complemento para Gradient Boosting optimizado (mas rapido que sklearn GBC, soporte GPU nativo).
+  - `optuna`: Hyperparameter tuning bayesiano que respeta el orden temporal.
+  - ~~`tensorflow/keras`~~: Eliminado en v2 junto con LSTM.
 
 ---
 
@@ -1005,13 +1134,27 @@ Donde:
 - `P_m(k)` = probabilidad/score del modelo `m` para el numero `k`
 - `w_m` = peso del modelo `m`, determinado por su rendimiento en validacion
 
-Los pesos se calculan inversamente proporcionales al error:
+Los pesos se calculan usando metricas coherentes con el problema de clasificacion:
+
+**Metodo primario — basado en Hit Rate (metrica de negocio):**
 
 ```
-             1 / RMSE_m
+             Hit_Rate_m
 w_m = -------------------------
-       SUM (1 / RMSE_j)  para todo j
+       SUM Hit_Rate_j  para todo j
 ```
+
+**Metodo alternativo — basado en Brier Score inverso (calibracion):**
+
+```
+             1 / BS_m
+w_m = -------------------------
+       SUM (1 / BS_j)  para todo j
+```
+
+Donde `BS_m` es el Brier Score del modelo `m` en walk-forward validation. Se usa Brier Score (no RMSE) porque es la metrica apropiada para evaluar probabilidades calibradas en clasificacion binaria.
+
+> **Nota (correccion v2):** La version anterior usaba RMSE para ponderar el ensamble, lo cual era inconsistente con la definicion de RMSE como metrica terciaria "NO para decision" en el Paso 5.6.2. Se corrigio para usar metricas de clasificacion.
 
 ### 6.2 Seleccion de Combinacion Optima
 
@@ -1115,7 +1258,9 @@ Cada ejecucion registrara:
 | **pandas** | 3.0.1 | Carga, limpieza y manipulacion de datos | API optima para datos tabulares, operaciones vectorizadas |
 | **numpy** | 2.4.3 | Calculos matematicos y estadisticos | Operaciones vectorizadas en C, base del ecosistema |
 | **scipy** | 1.17.1 | Tests estadisticos, distribuciones, calibracion | Tests con p-values exactos, funciones especiales, distribucion Beta |
-| **scikit-learn** | 1.8.0 | Modelos ML, validacion, calibracion, preprocesamiento | API unificada, CalibratedClassifierCV, pipelines |
+| **scikit-learn** | 1.8.0 | Modelos ML, validacion, calibracion, preprocesamiento | API unificada, CalibratedClassifierCV, pipelines, RFE |
+| **xgboost** | latest | Gradient Boosting optimizado con GPU | Mas rapido que sklearn GBC, soporte GPU nativo |
+| **optuna** | latest | Hyperparameter tuning bayesiano | Busqueda eficiente respetando orden temporal |
 | **matplotlib** | 3.10.8 | Graficos y visualizacion | Control total, formatos multiples, base de seaborn |
 | **seaborn** | 0.13.2 | Visualizacion estadistica | Graficos estadisticos elegantes, integracion pandas |
 | **requests** | 2.33.0 | Obtencion de datos remotos (si aplica) | Libreria HTTP mas usada, API simple y confiable |
@@ -1129,20 +1274,28 @@ Cada ejecucion registrara:
 1. Obtener CSV  -->  2. Validar datos  -->  3. EDA  -->  4. Features (con validacion temporal)
                                                               |
                                                               v
-                                                    4.5 Validar features
+                                                    4.5 Seleccion formal de features
+                                                        (MI, RFE, Boruta-like)
+                                                              |
+                                                              v
+                                                    4.6 Validar features
                                                         (sin fuga temporal)
                                                               |
                                                               v
-                                                    5.0 Baseline uniforme
+                                                    5.0 Manejo desbalance clases
                                                               |
                                                               v
-8. Exportar  <--  7. Evaluar vs baseline  <--  6. Entrenar modelos
+                                                    5.0.1 Baseline uniforme
+                                                              |
+                                                              v
+9. Exportar  <--  8. Evaluar vs baseline  <--  7. Entrenar modelos
      |                     |                   (Bayesiano -> RF -> GB
-     v                     |                    -> Markov -> LSTM?)
-  Modo PREDICTIVO          |
-  o DESCRIPTIVO   <--------+
-  (segun resultado
-   vs baseline)
+     v                     |                    -> Markov si test OK)
+  Modo PREDICTIVO          |                         |
+  o DESCRIPTIVO   <--------+                   6. Tuning (Optuna)
+  (segun resultado                                   |
+   vs baseline)                              5.6 Reproducibilidad
+                                               (random_state, hash)
 ```
 
 ---
@@ -1151,14 +1304,14 @@ Cada ejecucion registrara:
 
 Los modelos se implementaran y evaluaran en este orden estricto. Solo se avanza al siguiente si el anterior no supera al baseline:
 
-| Prioridad | Modelo | Complejidad | Justificacion |
-|-----------|--------|-------------|---------------|
-| 1 | Baseline Uniforme | Nula | Punto de referencia obligatorio |
-| 2 | Frecuencias Bayesianas | Baja | Regularizacion natural, incertidumbre cuantificada |
-| 3 | Random Forest Classifier | Media | Robusto, importancia de features |
-| 4 | Gradient Boosting Classifier | Media-Alta | Mayor precision en datos tabulares |
-| 5 | Cadenas de Markov | Media | Patrones secuenciales, interpretable |
-| 6 | LSTM (opcional) | Alta | Solo si autocorrelacion es significativa |
+| Prioridad | Modelo | Complejidad | Justificacion | Prerequisito |
+|-----------|--------|-------------|---------------|--------------|
+| 1 | Baseline Uniforme | Nula | Punto de referencia obligatorio | Ninguno |
+| 2 | Frecuencias Bayesianas | Baja | Regularizacion natural, incertidumbre cuantificada | Ninguno |
+| 3 | Random Forest Classifier | Media | Robusto, importancia de features, seleccion de features | `class_weight='balanced'` |
+| 4 | Gradient Boosting Classifier | Media-Alta | Mayor precision en datos tabulares | `class_weight='balanced'`, tuning con Optuna |
+| 5 | Cadenas de Markov | Media | Patrones secuenciales, interpretable | **Solo si Runs Test o Ljung-Box p < 0.05** |
+| ~~6~~ | ~~LSTM~~ | ~~Alta~~ | ~~Eliminado en v2: insuficientes datos, complejidad injustificada~~ | N/A |
 
 ## Proximos Pasos
 
