@@ -596,6 +596,8 @@ P_bayes_temporal(k) = ---------------------------
 - **Baseline robusto**: Si este modelo simple no supera al uniforme, es improbable que modelos mas complejos lo hagan de forma genuina.
 - **Cuantificacion de incertidumbre**: La distribucion posterior nos da intervalos de credibilidad directamente.
 
+### 5.2 Modelo 2: Random Forest Classifier
+
 #### 5.2.1 Fundamento Matematico
 
 Random Forest construye un ensamble de `B` arboles de decision, cada uno entrenado con un subconjunto aleatorio de datos (bootstrap) y features.
@@ -702,7 +704,7 @@ Donde `y` es la etiqueta binaria (numero aparecio o no) y `p` es la probabilidad
 
 ### 5.4 Modelo 4: Red Neuronal LSTM (Long Short-Term Memory) [OPCIONAL]
 
-#### 5.3.1 Fundamento Matematico
+#### 5.4.1 Fundamento Matematico
 
 LSTM es una arquitectura de red neuronal recurrente diseñada para aprender dependencias a largo plazo en secuencias:
 
@@ -740,7 +742,7 @@ Donde:
 - `W_f, W_i, W_C, W_o` = matrices de pesos
 - `b_f, b_i, b_C, b_o` = vectores de sesgo
 
-#### 5.3.2 Por que LSTM
+#### 5.4.2 Por que LSTM
 
 - **Memoria a largo plazo**: Puede capturar patrones ciclicos que se extienden por cientos de sorteos.
 - **Procesamiento secuencial**: Trata los sorteos como una serie temporal, manteniendo contexto.
