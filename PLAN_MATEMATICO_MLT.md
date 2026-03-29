@@ -6,6 +6,8 @@ Este documento detalla el plan tecnico y matematico para construir un sistema de
 
 > **Nota importante:** Los sorteos de loteria son eventos estocasticos independientes. Ningun modelo puede garantizar predicciones exactas. El objetivo de este proyecto es aplicar tecnicas estadisticas y de ML para identificar patrones, tendencias y distribuciones que permitan generar combinaciones con mayor fundamento analitico que la seleccion aleatoria.
 
+> **Principio rector:** Todo modelo debe compararse obligatoriamente contra un **baseline uniforme** (seleccion aleatoria). Si ningun modelo supera al baseline de forma estadisticamente significativa en backtesting temporal, el sistema adoptara un enfoque **descriptivo** (analisis de patrones y frecuencias) en lugar de predictivo. La honestidad estadistica es prioritaria.
+
 ---
 
 ## Paso 1: Obtencion del Archivo CSV con Resultados Historicos
@@ -430,6 +432,8 @@ H = -SUM p_i * log2(p_i)
 
 Donde `p_i = r_i / SUM(r_j)`. Sorteos con numeros muy dispersos tienen mayor entropia.
 
+> **Nota:** Esta definicion de `p_i` es una aproximacion heuristica para asignar pesos a los numeros dentro de un sorteo. No representa una distribucion de probabilidad formal del juego, sino una medida relativa de la dispersion de valores.
+
 #### 4.3.2 Distancia de Mahalanobis
 
 Mide que tan "atipico" es un sorteo respecto a la distribucion historica:
@@ -445,7 +449,23 @@ Donde:
 
 Sorteos con `D_M` alto son atipicos. Esto nos ayuda a definir que combinaciones son "razonables".
 
-### 4.4 Libreria: scikit-learn (sklearn)
+### 4.4 Validacion de Features contra Fuga Temporal
+
+Antes de usar cualquier feature en el modelo, debemos verificar que **no contenga informacion del futuro** (data leakage temporal):
+
+1. **Regla estricta**: Cada feature del sorteo `t` solo puede usar datos de sorteos `1..t-1`.
+2. **Validacion de estabilidad**: Calcular cada feature en ventanas de 200 sorteos consecutivos y medir su varianza inter-ventana:
+
+```
+                      K
+Estabilidad(f) = 1 - CV(f) = 1 - (std(f_1..f_K) / mean(f_1..f_K))
+```
+
+Donde `f_k` es el valor del feature en la ventana `k`. Features con `Estabilidad < 0.5` son inestables y deben descartarse.
+
+3. **Test de causalidad temporal**: Para cada feature, comparar su correlacion con el target en datos pasados vs. datos futuros. Si la correlacion futura es significativamente mayor, el feature tiene fuga temporal.
+
+### 4.5 Libreria: scikit-learn (sklearn)
 
 **Por que scikit-learn es la opcion optima para ingenieria de features:**
 
@@ -461,50 +481,174 @@ Sorteos con `D_M` alto son atipicos. Esto nos ayuda a definir que combinaciones 
 
 ## Paso 5: Modelos de Machine Learning para Prediccion
 
-### 5.1 Modelo 1: Random Forest Regressor
+### 5.0 Reformulacion del Problema: Clasificacion Multi-etiqueta Combinatoria
+
+**Cambio critico respecto al enfoque original:** En lugar de tratar la prediccion como un problema de **regresion** (predecir numeros exactos), lo reformulamos como un problema **combinatorio/multi-etiqueta**:
+
+- **Regresion** (enfoque anterior): Predecir `y = [r1, r2, ..., r6]` como valores continuos. Problema: los numeros de loteria no son valores continuos con relacion ordinal significativa.
+- **Clasificacion multi-etiqueta** (enfoque mejorado): Para cada numero `k` en `[1, N]`, predecir la probabilidad `P(k aparece en el proximo sorteo)`. Luego seleccionar los `m` numeros con mayor probabilidad.
+
+Formalmente, para cada numero `k`:
+
+```
+P(k in S_{t+1} | features_t) = f_modelo(features_t)
+```
+
+Donde `S_{t+1}` es el conjunto de numeros del sorteo `t+1`.
+
+Este enfoque es superior porque:
+1. Respeta la naturaleza combinatoria del juego (elegir `m` de `N`).
+2. Produce probabilidades calibrables para cada numero.
+3. Permite aplicar restricciones combinatorias naturalmente.
+4. Es compatible con metricas de negocio como Hit@k.
+
+### 5.0.1 Baseline Obligatorio: Modelo Uniforme Aleatorio
+
+**TODO modelo debe superar este baseline** para justificar su complejidad:
+
+```
+P_baseline(k) = m / N    para todo k en [1, N]
+```
+
+Para Melate (6 de 56): `P_baseline(k) = 6/56 = 0.1071` para cada numero.
+
+**Rendimiento esperado del baseline:**
+
+```
+E[aciertos por sorteo] = m * (m / N) = m^2 / N = 36/56 = 0.643
+```
+
+**Test de superioridad (binomial test):**
+
+Para declarar que un modelo supera al baseline, necesitamos significancia estadistica:
+
+```
+H0: P(modelo acierta) = P(baseline acierta)
+H1: P(modelo acierta) > P(baseline acierta)
+
+p-value = P(X >= aciertos_modelo | X ~ Binomial(n_tests, p_baseline))
+```
+
+Rechazamos H0 solo si `p-value < 0.05`. Este test se aplica en **backtesting temporal** con datos que el modelo nunca vio durante entrenamiento.
+
+### 5.1 Modelo 1: Frecuencias Bayesianas (Modelo Simple Prioritario)
 
 #### 5.1.1 Fundamento Matematico
 
-Random Forest construye un ensamble de `B` arboles de decision, cada uno entrenado con un subconjunto aleatorio de datos (bootstrap) y features:
+Antes de usar modelos complejos, comenzamos con un enfoque bayesiano simple que estima la probabilidad de cada numero usando un prior conjugado:
+
+**Prior: Distribucion Beta**
+
+```
+P(theta_k) = Beta(alpha, beta)
+```
+
+Donde `alpha = beta = 1` (prior uniforme/no informativo).
+
+**Posterior tras observar datos:**
+
+```
+P(theta_k | datos) = Beta(alpha + exitos_k, beta + fracasos_k)
+```
+
+Donde:
+- `exitos_k` = numero de sorteos donde `k` aparecio
+- `fracasos_k` = numero de sorteos donde `k` NO aparecio
+
+**Estimacion puntual (media posterior):**
+
+```
+                     alpha + exitos_k
+P_bayes(k) = ----------------------------------
+              alpha + beta + exitos_k + fracasos_k
+```
+
+Con prior uniforme `(alpha=1, beta=1)`:
+
+```
+                  1 + f(k)
+P_bayes(k) = ---------------
+                2 + n
+```
+
+Donde `f(k)` es la frecuencia absoluta del numero `k` y `n` es el total de sorteos.
+
+**Intervalo de credibilidad bayesiano (95%):**
+
+```
+IC_95%(theta_k) = [Beta_inv(0.025, a_post, b_post), Beta_inv(0.975, a_post, b_post)]
+```
+
+#### 5.1.2 Variante con Ventana Temporal
+
+Para capturar tendencias recientes, usamos solo los ultimos `w` sorteos:
+
+```
+                         1 + f(k, ultimos w)
+P_bayes_temporal(k) = ---------------------------
+                           2 + w
+```
+
+#### 5.1.3 Por que Frecuencias Bayesianas como Primer Modelo
+
+- **Simplicidad**: Facil de implementar, interpretar y depurar.
+- **Regularizacion natural**: El prior evita probabilidades de 0 o 1 con pocos datos.
+- **Baseline robusto**: Si este modelo simple no supera al uniforme, es improbable que modelos mas complejos lo hagan de forma genuina.
+- **Cuantificacion de incertidumbre**: La distribucion posterior nos da intervalos de credibilidad directamente.
+
+### 5.2 Modelo 2: Random Forest Classifier
+
+#### 5.2.1 Fundamento Matematico
+
+Random Forest construye un ensamble de `B` arboles de decision, cada uno entrenado con un subconjunto aleatorio de datos (bootstrap) y features.
+
+**Reformulado como clasificacion:** En lugar de regresion, usamos `RandomForestClassifier` donde para cada numero `k`, entrenamos un clasificador binario:
+
+```
+y_k(t) = 1 si k aparecio en el sorteo t, 0 en caso contrario
+```
+
+La prediccion del ensamble es:
 
 ```
                   1   B
-f_hat(x) = --- SUM T_b(x)
+P(y_k=1|x) = --- SUM T_b(x)_k
                   B  b=1
 ```
 
-Donde `T_b(x)` es la prediccion del arbol `b`.
+Donde `T_b(x)_k` es la prediccion de probabilidad del arbol `b` para la clase `y_k=1`.
 
-**Criterio de division (MSE):**
+**Criterio de division (Gini Impurity para clasificacion):**
 
-En cada nodo, el arbol busca la division que minimiza:
+En cada nodo, el arbol busca la division que minimiza la impureza:
 
 ```
-MSE = (1/n_L) * SUM (y_i - y_barra_L)^2  +  (1/n_R) * SUM (y_j - y_barra_R)^2
+Gini(S) = 1 - SUM p_c^2
 ```
 
-Donde `L` y `R` son los subconjuntos izquierdo y derecho.
+Donde `p_c` es la proporcion de la clase `c` en el nodo `S`.
 
 **Importancia de features (Mean Decrease Impurity):**
 
 ```
                      B
-Imp(feature_j) = (1/B) SUM  SUM  p(t) * delta_MSE(t, j)
+Imp(feature_j) = (1/B) SUM  SUM  p(t) * delta_Gini(t, j)
                      b=1  t in T_b
 ```
 
 Esto nos dice cuales features contribuyen mas a la prediccion.
 
-#### 5.1.2 Por que Random Forest
+#### 5.2.2 Por que Random Forest
 
 - **Robusto a overfitting**: El promedio de multiples arboles reduce la varianza sin aumentar el sesgo.
 - **No requiere normalizacion**: Funciona con features en diferentes escalas.
 - **Importancia de features**: Proporciona un ranking natural de que variables son mas predictivas.
 - **No linealidad**: Captura relaciones no lineales entre features y numeros.
+- **Probabilidades**: `predict_proba()` devuelve probabilidades calibrables por numero.
 
-### 5.2 Modelo 2: Gradient Boosting (XGBoost / LightGBM)
+### 5.3 Modelo 3: Gradient Boosting Classifier (XGBoost / LightGBM)
 
-#### 5.2.1 Fundamento Matematico
+#### 5.3.1 Fundamento Matematico
 
 Gradient Boosting construye arboles secuencialmente, donde cada arbol corrige los errores del anterior:
 
@@ -543,15 +687,24 @@ Donde:
 - `T_j` = numero de hojas del arbol `j`
 - `w_j` = pesos de las hojas
 
-#### 5.2.2 Por que Gradient Boosting
+**Reformulado como clasificacion:** Usamos `XGBClassifier` con funcion de perdida de log-loss:
+
+```
+L(y, p) = -[y * log(p) + (1-y) * log(1-p)]
+```
+
+Donde `y` es la etiqueta binaria (numero aparecio o no) y `p` es la probabilidad predicha.
+
+#### 5.3.2 Por que Gradient Boosting
 
 - **Mayor precision**: Generalmente supera a Random Forest en datasets tabulares.
 - **Regularizacion integrada**: Controla overfitting con `gamma`, `lambda` y `eta`.
 - **Manejo de missing values**: XGBoost aprende automaticamente la direccion optima para nulos.
+- **Probabilidades calibradas**: La funcion sigmoide de salida produce probabilidades directamente.
 
-### 5.3 Modelo 3: Red Neuronal LSTM (Long Short-Term Memory)
+### 5.4 Modelo 4: Red Neuronal LSTM (Long Short-Term Memory) [OPCIONAL]
 
-#### 5.3.1 Fundamento Matematico
+#### 5.4.1 Fundamento Matematico
 
 LSTM es una arquitectura de red neuronal recurrente diseñada para aprender dependencias a largo plazo en secuencias:
 
@@ -589,17 +742,17 @@ Donde:
 - `W_f, W_i, W_C, W_o` = matrices de pesos
 - `b_f, b_i, b_C, b_o` = vectores de sesgo
 
-#### 5.3.2 Por que LSTM
+#### 5.4.2 Por que LSTM
 
 - **Memoria a largo plazo**: Puede capturar patrones ciclicos que se extienden por cientos de sorteos.
 - **Procesamiento secuencial**: Trata los sorteos como una serie temporal, manteniendo contexto.
 - **Flexibilidad**: Puede modelar relaciones temporales complejas y no lineales.
 
-**Nota:** Evaluaremos si la complejidad de LSTM se justifica frente a los modelos de ensamble. Si los datos no muestran patrones temporales fuertes, Random Forest o Gradient Boosting seran preferibles por su simplicidad y eficiencia.
+> **IMPORTANTE — Modelo de baja prioridad:** LSTM solo se implementara si los modelos mas simples (Frecuencias Bayesianas, Random Forest, Gradient Boosting) demuestran que existen patrones temporales significativos en los datos (verificado via autocorrelacion significativa en Paso 3.5.3). Si la autocorrelacion no es significativa, LSTM no se justifica y se omitira. Ademas, `tensorflow/keras` no esta en `requirements.txt` actualmente; solo se agregara si se decide implementar LSTM.
 
-### 5.4 Modelo 4: Cadenas de Markov
+### 5.5 Modelo 5: Cadenas de Markov
 
-#### 5.4.1 Fundamento Matematico
+#### 5.5.1 Fundamento Matematico
 
 Modelamos la transicion entre estados (numeros) como un proceso de Markov:
 
@@ -648,57 +801,45 @@ P^n = Q * Lambda^n * Q^(-1)
 
 Donde `Lambda` es la matriz diagonal de autovalores de `P` y `Q` la matriz de autovectores.
 
-#### 5.4.2 Por que Cadenas de Markov
+#### 5.5.2 Por que Cadenas de Markov
 
 - **Interpretabilidad**: Las probabilidades de transicion son directamente comprensibles.
 - **Prediccion directa**: `P^n` nos da probabilidades de prediccion a `n` sorteos futuros.
 - **Deteccion de patrones secuenciales**: Captura que numeros tienden a "seguir" a otros.
 
-### 5.5 Evaluacion y Seleccion de Modelos
+### 5.6 Evaluacion y Seleccion de Modelos
 
-#### 5.5.1 Validacion Cruzada (K-Fold)
+#### 5.6.1 Validacion Walk-Forward Estricta
 
-```
-               1   K
-CV_score = --- SUM Score(M, D_train_k, D_test_k)
-               K  k=1
-```
-
-Usaremos **Time Series Split** (variante de K-Fold que respeta el orden temporal):
-- Fold 1: train = sorteos 1..100, test = sorteos 101..150
-- Fold 2: train = sorteos 1..150, test = sorteos 151..200
-- etc.
-
-#### 5.5.2 Metricas de Evaluacion
-
-**Error Absoluto Medio (MAE):**
+En lugar de K-Fold estandar (que mezcla datos temporales), usamos **Walk-Forward Validation** que simula exactamente como se usaria el modelo en produccion:
 
 ```
-           1   n
-MAE = --- SUM |y_i - y_hat_i|
-           n  i=1
+Para t = T_inicio hasta T_final:
+    1. Entrenar modelo con sorteos 1..t-1
+    2. Predecir sorteo t
+    3. Registrar aciertos
+    4. Avanzar: t = t + 1
 ```
 
-**Raiz del Error Cuadratico Medio (RMSE):**
+**Variante con ventana deslizante** (para capturar cambios de regimen):
 
 ```
-              ___________________________
-             / 1   n
-RMSE = sqrt| --- SUM (y_i - y_hat_i)^2 |
-             \ n  i=1                    /
+Para t = T_inicio hasta T_final:
+    1. Entrenar modelo con sorteos max(1, t-W)..t-1   (ventana de W sorteos)
+    2. Predecir sorteo t
+    3. Registrar aciertos
 ```
 
-**Coeficiente de Determinacion (R^2):**
+Esto es mas riguroso que Time Series Split porque:
+- Evalua en **cada** sorteo, no solo en bloques.
+- Nunca usa datos futuros para entrenar.
+- Simula el uso real del sistema.
 
-```
-              SUM (y_i - y_hat_i)^2
-R^2 = 1 - -------------------------
-              SUM (y_i - y_barra)^2
-```
+#### 5.6.2 Metricas de Evaluacion (Priorizadas por Relevancia)
 
-- `R^2 = 1`: prediccion perfecta
-- `R^2 = 0`: el modelo no es mejor que predecir la media
-- `R^2 < 0`: el modelo es peor que predecir la media
+**Metricas PRIMARIAS (metricas de negocio):**
+
+Estas son las metricas que determinan si el modelo es util:
 
 **Hit Rate (Tasa de Acierto):**
 
@@ -710,17 +851,141 @@ Hit_Rate(k) = ------------------------------------------------------------------
                                     total de sorteos evaluados
 ```
 
-### 5.6 Libreria Principal: scikit-learn
+**Distribucion de Aciertos:**
+
+```
+Dist(j) = P(exactamente j aciertos en un sorteo)
+
+        = count(sorteos con j aciertos) / total_sorteos
+```
+
+Compararemos esta distribucion contra la distribucion hipergeometrica esperada por azar:
+
+```
+                    C(m, j) * C(N-m, m-j)
+P_azar(j aciertos) = -------------------------
+                          C(N, m)
+```
+
+**ROI Simulado:**
+
+Si el sistema se usara para jugar, el ROI estimado seria:
+
+```
+              ganancia_total - costo_total
+ROI = 100 * --------------------------------
+                   costo_total
+```
+
+Donde `ganancia_total` considera los premios por nivel de aciertos y `costo_total` es el numero de sorteos jugados por el costo del boleto.
+
+**Metricas SECUNDARIAS (diagnostico del modelo):**
+
+**Brier Score (calibracion de probabilidades):**
+
+```
+             1   n
+BS = --- SUM (p_i - o_i)^2
+             n  i=1
+```
+
+Donde `p_i` es la probabilidad predicha y `o_i` es el resultado observado (0 o 1). Un Brier Score bajo indica buena calibracion. Para el baseline uniforme:
+
+```
+BS_baseline = (m/N) * (1 - m/N) = 0.1071 * 0.8929 = 0.0956
+```
+
+**Log-Loss (entropia cruzada binaria):**
+
+```
+               1   n
+LogLoss = - --- SUM [o_i * log(p_i) + (1-o_i) * log(1-p_i)]
+               n  i=1
+```
+
+**Metricas TERCIARIAS (solo como referencia, NO para decision):**
+
+MAE y RMSE se reportaran pero no se usaran para seleccionar modelos, ya que no son adecuadas para problemas de clasificacion multi-etiqueta:
+
+```
+MAE = (1/n) SUM |y_i - y_hat_i|
+RMSE = sqrt((1/n) SUM (y_i - y_hat_i)^2)
+```
+
+#### 5.6.3 Calibracion de Probabilidades
+
+Las probabilidades crudas de los modelos suelen estar mal calibradas. Aplicaremos:
+
+**Platt Scaling (Regresion Logistica):**
+
+Ajustar una sigmoide sobre las probabilidades crudas:
+
+```
+P_calibrada = 1 / (1 + exp(A * P_cruda + B))
+```
+
+Donde `A` y `B` se ajustan por maxima verosimilitud en un conjunto de validacion.
+
+**Regresion Isotonica:**
+
+Ajuste no parametrico que preserva el orden:
+
+```
+P_calibrada = f_isotonica(P_cruda)
+```
+
+Donde `f_isotonica` es una funcion monotona no decreciente ajustada por minimos cuadrados.
+
+**Curva de Calibracion (Reliability Diagram):**
+
+Divide las predicciones en bins por probabilidad predicha y compara con la frecuencia real:
+
+```
+Para cada bin b con probabilidad media p_b:
+    frecuencia_real_b = count(positivos en bin b) / count(muestras en bin b)
+    
+    Modelo calibrado: frecuencia_real_b ~ p_b
+```
+
+#### 5.6.4 Comparacion Obligatoria contra Baseline
+
+**Regla de decision:**
+
+```
+Si p_value(test binomial, modelo vs baseline) < 0.05:
+    -> Modelo aprobado: usar para prediccion
+Si no:
+    -> Modelo descartado: no es mejor que el azar
+    -> Adoptar enfoque descriptivo (analisis de patrones sin prediccion)
+```
+
+Adicional, compararemos contra **S=10,000 simulaciones aleatorias equivalentes**:
+
+```
+Para s = 1 hasta S:
+    1. Generar predicciones aleatorias (m numeros de N)
+    2. Calcular Hit_Rate de las predicciones aleatorias
+
+percentil_modelo = P(Hit_Rate_aleatorio < Hit_Rate_modelo)
+
+Si percentil_modelo > 0.95:
+    -> Modelo supera al azar
+Si no:
+    -> Modelo NO supera al azar
+```
+
+### 5.7 Libreria Principal: scikit-learn
 
 **Por que scikit-learn es la opcion optima para modelado:**
 
 - **API unificada**: Todos los modelos siguen el patron `fit()` / `predict()` / `score()`, facilitando la comparacion.
-- **Modelos completos**: RandomForestRegressor, GradientBoostingRegressor, cross_val_score, GridSearchCV.
+- **Clasificadores completos**: RandomForestClassifier, GradientBoostingClassifier, cross_val_score, GridSearchCV.
+- **Calibracion integrada**: `CalibratedClassifierCV` implementa Platt Scaling e Isotonic Regression.
 - **Pipelines**: Encadenan preprocesamiento + modelo en un solo objeto reproducible.
 - **Comunidad y documentacion**: La libreria de ML mas usada en Python con documentacion exhaustiva.
 - **Alternativas complementarias**:
-  - `xgboost`: Se usara como complemento para Gradient Boosting optimizado (mas rapido que sklearn GBR).
-  - `tensorflow/keras`: Solo si LSTM demuestra ser superior en la evaluacion; no se incluira por defecto para mantener el stack simple.
+  - `xgboost`: Se usara como complemento para Gradient Boosting optimizado (mas rapido que sklearn GBC).
+  - `tensorflow/keras`: Solo si LSTM se justifica por autocorrelacion significativa; no se incluira por defecto.
 
 ---
 
@@ -785,7 +1050,32 @@ Para b = 1 hasta B:
 IC(95%) = [percentil_2.5(predicciones), percentil_97.5(predicciones)]
 ```
 
-### 6.4 Libreria: matplotlib
+### 6.4 Comparacion Final contra Simulaciones Aleatorias
+
+Antes de aceptar cualquier prediccion como valida, la comparamos contra `S=10,000` simulaciones de seleccion puramente aleatoria:
+
+```
+Para s = 1 hasta 10,000:
+    1. Seleccionar m numeros uniformemente al azar de [1, N]
+    2. Calcular aciertos contra el sorteo real
+
+Distribucion_azar = histograma(aciertos de las 10,000 simulaciones)
+Percentil_modelo = P(aciertos_azar < aciertos_modelo)
+```
+
+Esto proporciona una medida empirica de si las predicciones del modelo son genuinamente superiores al azar o si los resultados observados podrian deberse a varianza aleatoria.
+
+**Regla de decision final:**
+
+```
+Si Percentil_modelo > 95% de forma consistente en walk-forward:
+    -> Sistema en modo PREDICTIVO: generar y reportar predicciones
+Si no:
+    -> Sistema en modo DESCRIPTIVO: reportar analisis de patrones,
+       frecuencias y tendencias SIN emitir predicciones numericas
+```
+
+### 6.5 Libreria: matplotlib
 
 **Por que matplotlib es la opcion optima para visualizacion:**
 
@@ -824,8 +1114,8 @@ Cada ejecucion registrara:
 |----------|---------|---------------|---------------|
 | **pandas** | 3.0.1 | Carga, limpieza y manipulacion de datos | API optima para datos tabulares, operaciones vectorizadas |
 | **numpy** | 2.4.3 | Calculos matematicos y estadisticos | Operaciones vectorizadas en C, base del ecosistema |
-| **scipy** | 1.17.1 | Tests estadisticos, distribuciones | Tests con p-values exactos, funciones especiales |
-| **scikit-learn** | 1.8.0 | Modelos ML, validacion, preprocesamiento | API unificada, modelos robustos, pipelines |
+| **scipy** | 1.17.1 | Tests estadisticos, distribuciones, calibracion | Tests con p-values exactos, funciones especiales, distribucion Beta |
+| **scikit-learn** | 1.8.0 | Modelos ML, validacion, calibracion, preprocesamiento | API unificada, CalibratedClassifierCV, pipelines |
 | **matplotlib** | 3.10.8 | Graficos y visualizacion | Control total, formatos multiples, base de seaborn |
 | **seaborn** | 0.13.2 | Visualizacion estadistica | Graficos estadisticos elegantes, integracion pandas |
 | **requests** | 2.33.0 | Obtencion de datos remotos (si aplica) | Libreria HTTP mas usada, API simple y confiable |
@@ -836,16 +1126,43 @@ Cada ejecucion registrara:
 ## Orden de Ejecucion del Script
 
 ```
-1. Obtener CSV  -->  2. Validar datos  -->  3. EDA  -->  4. Features
+1. Obtener CSV  -->  2. Validar datos  -->  3. EDA  -->  4. Features (con validacion temporal)
                                                               |
                                                               v
-7. Exportar  <--  6. Generar prediccion  <--  5. Entrenar modelos
+                                                    4.5 Validar features
+                                                        (sin fuga temporal)
+                                                              |
+                                                              v
+                                                    5.0 Baseline uniforme
+                                                              |
+                                                              v
+8. Exportar  <--  7. Evaluar vs baseline  <--  6. Entrenar modelos
+     |                     |                   (Bayesiano -> RF -> GB
+     v                     |                    -> Markov -> LSTM?)
+  Modo PREDICTIVO          |
+  o DESCRIPTIVO   <--------+
+  (segun resultado
+   vs baseline)
 ```
 
 ---
+
+## Orden de Prioridad de Modelos
+
+Los modelos se implementaran y evaluaran en este orden estricto. Solo se avanza al siguiente si el anterior no supera al baseline:
+
+| Prioridad | Modelo | Complejidad | Justificacion |
+|-----------|--------|-------------|---------------|
+| 1 | Baseline Uniforme | Nula | Punto de referencia obligatorio |
+| 2 | Frecuencias Bayesianas | Baja | Regularizacion natural, incertidumbre cuantificada |
+| 3 | Random Forest Classifier | Media | Robusto, importancia de features |
+| 4 | Gradient Boosting Classifier | Media-Alta | Mayor precision en datos tabulares |
+| 5 | Cadenas de Markov | Media | Patrones secuenciales, interpretable |
+| 6 | LSTM (opcional) | Alta | Solo si autocorrelacion es significativa |
 
 ## Proximos Pasos
 
 1. **Implementar Paso 1**: Modulo `data_service.py` para obtener y validar el CSV historico.
 2. **Definir fuente del CSV**: Determinar si el archivo sera local, descargado de una URL, o via API.
 3. **Comenzar EDA**: Implementar el analisis exploratorio en un Jupyter Notebook para explorar los datos antes de automatizar.
+4. **Implementar Baseline**: Crear el modelo uniforme aleatorio como primera referencia de comparacion.
